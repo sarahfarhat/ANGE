@@ -2,8 +2,16 @@
 #SBATCH --job-name=annotGenes_pipeline
 #SBATCH --partition=long
 #SBATCH --time=30-00:00:00
-#SBATCH --mem=50GB
-#SBATCH --cpus-per-task=28
+#SBATCH --mem=4GB
+#SBATCH --cpus-per-task=2
+
+# NB: this job is now just a lightweight driver, not where the actual work happens. With
+# process.executor = 'slurm' (see nextflow.config's singularity profile), every pipeline task
+# submits as its OWN separate sbatch job - some on 'short', the heavy ones (blast, exonerate,
+# gmove, minimap2, genome-mode busco) on 'long' - instead of all running inside this
+# allocation. This job just needs to stay alive as long as the whole pipeline runs (hence
+# still --time=30-00:00:00 on 'long') and keep polling/submitting those jobs, which barely
+# takes any cpu/memory of its own - hence the drop from 28 cpus/50GB down to 2 cpus/4GB.
 
 # Load modules
 module load nextflow/24.04.4

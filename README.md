@@ -79,6 +79,26 @@ nextflow run main.nf -profile singularity -resume
 nextflow run main.nf -profile test -resume
 ```
 
+### Parallelism on the cluster
+
+`-profile singularity` submits every pipeline task as its **own SLURM job** (`process.executor
+= 'slurm'`), not as a subprocess sharing `run_ANGE`'s single allocation. This matters because
+this pipeline runs every protein-database and transcriptome-assembly file as its own
+independent branch (see "Evidence traceability by source" below) - up to 16 branches, each
+internally chunked for blast, plus 34 busco runs when `run_busco` is on - and all of that only
+actually runs concurrently if each task gets its own job rather than fighting over one shared
+resource pool. `run_ANGE`'s own job is now just a lightweight driver (2 cpus, 4GB) that stays
+alive and submits/polls the real work; the real tasks split across a `short` queue (quick
+bookkeeping steps and per-source work that doesn't scale with genome size) and a `long` queue
+(whole-genome blast/exonerate, gmove, minimap2, genome-mode busco), both configured via
+`withName:` selectors in `nextflow.config`'s `singularity` profile.
+
+**I don't have real runtimes or memory footprints for your actual genome and dataset to size
+those `short`/`long` groupings or their cpu/memory values against** - they're conservative
+starting points, not measurements. Every task that fails from hitting its time or memory limit
+automatically retries once with more memory; if something still fails, or a `short`-queue task
+turns out to routinely run long, move it into the `long` `withName:` block (or its own).
+
 No container engine is enabled by default - it's only ever turned on by a profile (see
 `nextflow.config`), so each run picks exactly one engine via `-profile`.
 
