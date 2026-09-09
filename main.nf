@@ -45,10 +45,14 @@ include { mergegff as mergegfftrans }          from "${baseDir}/modules/mergegff
 // Setting it this late (after the `include` statements above, which is when each module's
 // directives - including publishDir - get parsed) was the cause of the "publishDir path
 // contains a variable with a null value" bug / the stray "null/" output directory.
+// NB: chunkSize's default lives in nextflow.config (params{ chunkSize=... }), not here -
+// same reasoning as outdir above. A second `params.chunkSize = ...` line used to sit here
+// too and silently overrode the config value on every run (99000 instead of the 10000 in
+// nextflow.config) - harmless while -profile test was always overriding it anyway, but
+// exactly the kind of thing to catch before a real production run.
 params.nb_cpus        = 28
 params.idprot          = 0.95
 params.idpercentprot   = 50
-params.chunkSize       = 99000
 params.topHits         = 3
 
 // Protein-evidence alignment (doc step 7, peptide branch)
