@@ -1,15 +1,16 @@
 #!/usr/bin/env nextflow
 
+// id carried through untouched - query_dir/genome_dir arrive together with it in one tuple,
+// straight from extractseq.nf's output.
 process exonerate {
     conda 'bioconda::exonerate=2.4.0'
     input:
-    path query_dir
-    path genome_dir
+    tuple val(id), path(query_dir), path(genome_dir)
     val mode
     val percentThreshold
 
     output:
-    path "exonerate_out", emit: exo_dir
+    tuple val(id), path("exonerate_out"), emit: exo_dir
 
     script:
     """

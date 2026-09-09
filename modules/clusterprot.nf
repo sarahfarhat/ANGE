@@ -1,13 +1,16 @@
 #!/usr/bin/env nextflow
 
+// id carried through untouched (see cleanproteindb.nf) - runs once per source file, so
+// redundancy is only removed *within* one source, never across sources (that's the whole
+// point of the per-source design: no cross-file dedup, full traceability instead).
 process clusterprot {
     container 'community.wave.seqera.io/library/cd-hit:4.8.1--8078bb96af799bf2'
     input:
-    path proteins_file
+    tuple val(id), path(proteins_file)
     val idper
 
     output:
-    path "cleaned_proteins.fasta" 
+    tuple val(id), path("cleaned_proteins.fasta")
 
     script:
     """

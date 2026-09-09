@@ -5,15 +5,16 @@
 // repeat protein database (e.g. RepBase peptide library, which is not publicly redistributable
 // so you must provide your own copy via params.repbase_db) and drop any sequence with a
 // significant hit before it goes into the genome blast.
+// id carried through untouched (see cleanproteindb.nf) - runs once per source file.
 process repbasefilter {
     container 'community.wave.seqera.io/library/blast:2.16.0--540f4b669b0a0ddd'
     input:
-    path proteins_file
+    tuple val(id), path(proteins_file)
     path repbase_db
     val evalue
 
     output:
-    path "proteins_norepeat.fasta"
+    tuple val(id), path("proteins_norepeat.fasta")
 
     script:
     """

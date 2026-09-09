@@ -7,13 +7,16 @@ process buscoassess {
     publishDir { "${params.outdir}/busco" }, mode: 'copy'
 
     input:
-    path fasta
+    tuple val(label), path(fasta) // label names this run's output dir and its
+                                   // aggregation-friendly summary copy, e.g. 'genome',
+                                   // 'final_gmove', 'protein_branch_uniprotkb_D1' - now
+                                   // carried alongside its fasta in one tuple so per-source
+                                   // busco runs (one per protein-database/transcriptome file,
+                                   // see main.nf) stay correctly paired with their own label.
     val mode         // busco -m: 'genome', 'transcriptome', or 'proteins'
     path lineage_dir // pre-downloaded lineage dataset directory - see buscodownload.nf. A
                       // local path (rather than a bare lineage name) tells busco to use it
                       // directly instead of trying to download its own copy.
-    val label        // names this run's output dir and its aggregation-friendly summary
-                      // copy - e.g. 'genome', 'final_gmove', 'protein_branch_gene_models'
 
     output:
     path "${label}_busco",             emit: dir

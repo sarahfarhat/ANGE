@@ -1,11 +1,16 @@
 #!/usr/bin/env nextflow
 
+// Runs once per input source file (protein database or transcript assembly - see the
+// sourceId()-tagged channels in main.nf) rather than once on a pre-merged file, so the id
+// travels alongside the sequences through every downstream step and each source's evidence
+// stays traceable all the way to the final gff (see the evidence_source attribute added in
+// mergegff.nf).
 process cleanproteindb {
     input:
-    path proteins_file
+    tuple val(id), path(proteins_file)
 
     output:
-    path "proteins.fasta"
+    tuple val(id), path("proteins.fasta")
 
     script:
     """

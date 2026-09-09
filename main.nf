@@ -29,10 +29,23 @@ include { buscoassess as buscoassessgenome }   from "${baseDir}/modules/buscoass
 include { buscoassess as buscoassessprot }     from "${baseDir}/modules/buscoassess.nf"
 include { buscoassess as buscoassesstrans }    from "${baseDir}/modules/buscoassess.nf"
 include { buscoassess as buscoassessfinal }    from "${baseDir}/modules/buscoassess.nf"
+// The two "original file" busco checks below run on params.proteindatabase/transcriptomes
+// exactly as given - a sanity check on the input evidence itself, independent of the genome
+// or this pipeline's own gene-finding - see the BUSCO section of the workflow below.
+include { buscoassess as buscoassessprotorig }  from "${baseDir}/modules/buscoassess.nf"
+include { buscoassess as buscoassesstransorig } from "${baseDir}/modules/buscoassess.nf"
 include { buscosummary }                       from "${baseDir}/modules/buscosummary.nf"
+include { translateprot }                      from "${baseDir}/modules/translateprot.nf"
+
+// Concatenates per-source gff3 files into one labeled evidence file, right before gmove/BUSCO
+// need a single file - see combineevidence.nf. Aliased three ways: the final protein-branch
+// evidence, the final transcript-branch evidence, and (only when run_low_count_filter is on)
+// the pre-mergegff protein-branch exonerate output that step's read-count filter needs.
+include { combineevidence as combineProteinEvidence }    from "${baseDir}/modules/combineevidence.nf"
+include { combineevidence as combineTranscriptEvidence } from "${baseDir}/modules/combineevidence.nf"
+include { combineevidence as combineProteinExonerate }   from "${baseDir}/modules/combineevidence.nf"
 
 // Transcript-evidence branch (mirrors the protein branch above with blastn/cd-hit-est/est2genome)
-include { mergetranscripts }                   from "${baseDir}/modules/mergetranscripts.nf"
 include { clustertranscript }                  from "${baseDir}/modules/clustertranscript.nf"
 include { blasttranscript }                    from "${baseDir}/modules/blasttranscript.nf"
 include { filterblast as filterblasttrans }    from "${baseDir}/modules/filterblast.nf"
@@ -87,6 +100,18 @@ params.lowCountThreshold     = 10
 params.run_busco     = false
 params.busco_lineage = 'mollusca_odb12'
 
+// Derives a filesystem-safe, human-readable "source id" from an input fasta path - used to
+// tag which of several protein-database / transcriptome-assembly files each piece of
+// evidence came from, all the way through to the final gff (see the NB in mergegff.nf).
+// Strips a trailing .gz first, then the remaining last extension - "uniprotkb_D1.fasta" ->
+// "uniprotkb_D1", "spades_mimit01_transcripts_renamed.fa" -> "spades_mimit01_transcripts_renamed".
+def sourceId(f) {
+    def n = f.getFileName().toString()
+    if (n.endsWith('.gz')) { n = n[0..-4] }
+    def dot = n.lastIndexOf('.')
+    return dot > 0 ? n[0..<dot] : n
+}
+
 log.info """\
         ANGE - ANnotation of GEnes
         ===========================
@@ -106,37 +131,71 @@ log.info """\
         .stripIndent()
 
 workflow {
-        /* Treat proteins : Clean protein database: rename sequences and remove redundancy */
-        cleanproteindb(params.proteindatabase)
+        /* Treat proteins: params.proteindatabase can be a glob (e.g. "db/*.fasta") or a
+           comma-separated list of protein fasta files. Each file is carried through its own
+           independent branch (clean -> cluster -> [repbase] -> blast -> extract -> exonerate
+           -> mergegff), tagged with its own source id (see sourceId() above) - so every
+           gene_models.<id>.gff3 published under results/gene_models/ is traceable back to
+           exactly one input database file, with NO cross-file redundancy removal (that's the
+           deliberate trade-off of this design: full traceability over the compute savings
+           cd-hit would otherwise get by deduping near-identical sequences across sources).
+           All per-source protein evidence is only combined into one file right before gmove
+           (see combineProteinEvidence below), and even then every feature still carries an
+           evidence_source=<id> attribute (added in mergegff.nf) so origin is recoverable
+           from the merged file too. */
+        Channel.fromPath(params.proteindatabase.split(',').collect { it.trim() }, checkIfExists: true)
+               .map { f -> tuple(sourceId(f), f) }
+               .set { protein_sources_ch }
+
+        cleanproteindb(protein_sources_ch)
         clusterprot(cleanproteindb.out, params.idprot)
 
         /* Optional: drop sequences that match a repeat/REPbase protein database */
-        def proteins_final
+        def proteins_final_ch
         if (params.repbase_db) {
             repbasefilter(clusterprot.out, file(params.repbase_db), params.repbaseEvalue)
-            proteins_final = repbasefilter.out
+            proteins_final_ch = repbasefilter.out
         } else {
-            proteins_final = clusterprot.out
+            proteins_final_ch = clusterprot.out
         }
 
-        proteins_final
-                   .splitFasta(by: params.chunkSize, file:true)
+        /* index genome and blast each source's proteins onto it, chunked for parallelism
+           within a source - elem:1 splits only the fasta element of the (id, fasta) tuple,
+           tagging every resulting chunk with its source's id. */
+        proteins_final_ch
+                   .splitFasta(by: params.chunkSize, file: true, elem: 1)
                    .set { prot_ch }
 
-        /* index genome and blast proteins onto it */
         blastprot(params.genome_msk, prot_ch)
-        filterblastprot(params.genome_msk, blastprot.out.collect(), params.idpercentprot, params.topHits, 'protein')
+        blastprot.out
+                   .groupTuple()
+                   .set { protein_blast_grouped_ch }
+        filterblastprot(params.genome_msk, protein_blast_grouped_ch, params.idpercentprot, params.topHits)
 
-        /* Extract genome regions and their match sequences */
-        fx2tab_genome(file(params.genome))
-        fx2tab_dataset(proteins_final)
-        extractseqprot(fx2tab_genome.out, fx2tab_dataset.out, filterblastprot.out, file("${baseDir}/modules/extractseq_v4.py"))
+        /* Extract genome regions and their match sequences, per source. genome_tab is the
+           same genome-wide table for every source (id discarded right after this call - it
+           has no "source" of its own); fx2tab_dataset's and filterblastprot's per-source
+           outputs are explicitly joined by id (not just paired by arrival order, since each
+           source finishes its own clean/cluster/blast/filter chain at a different pace). */
+        fx2tab_genome(tuple('genome', file(params.genome)))
+        fx2tab_genome.out
+                   .map { id, tab -> tab }
+                   .set { genome_tab_ch }
 
-        /* Align blast matches to the genome */
-        exonerateprot(extractseqprot.out.query_dir, extractseqprot.out.genome_dir, 'protein2genome', params.exoneratePercent)
+        fx2tab_dataset(proteins_final_ch)
+        fx2tab_dataset.out
+                   .join(filterblastprot.out)
+                   .set { extractseqprot_in_ch }
+        extractseqprot(genome_tab_ch, extractseqprot_in_ch, file("${baseDir}/modules/extractseq_v4.py"))
+
+        /* Align blast matches to the genome, per source */
+        exonerateprot(extractseqprot.out, 'protein2genome', params.exoneratePercent)
         exonerate2gffprot(exonerateprot.out.exo_dir)
 
-        /* Optional: flag poorly RNA-seq-supported genes for removal (needs raw fastq reads) */
+        /* Optional: flag poorly RNA-seq-supported genes for removal (needs raw fastq reads).
+           NB: computed once from ALL protein-branch sources combined (not per source) - RNA-
+           seq read support for a candidate gene doesn't depend on which protein database
+           first suggested it, so there is no reason to run this once per source. */
         def to_remove
         if (params.run_low_count_filter) {
             if (!params.reads1 || !params.reads2) {
@@ -145,7 +204,13 @@ workflow {
             minimap2index(file(params.genome))
             minimap2align(minimap2index.out, file(params.reads1), file(params.reads2))
             samtoolssort(minimap2align.out)
-            gffreadconvert(exonerate2gffprot.out)
+
+            exonerate2gffprot.out
+                       .map { id, gff -> gff }
+                       .collect()
+                       .set { protein_exonerate_gff_ch }
+            combineProteinExonerate(protein_exonerate_gff_ch, 'protein_exonerate_combined')
+            gffreadconvert(combineProteinExonerate.out)
             featurecounts(gffreadconvert.out, samtoolssort.out.bam, samtoolssort.out.bai)
             lowcountthreshold(featurecounts.out, params.lowCountThreshold)
             to_remove = lowcountthreshold.out
@@ -153,77 +218,153 @@ workflow {
             to_remove = file("${baseDir}/assets/empty_remove_list.txt")
         }
 
-        /* Filter result: merge monoexonic genes and (optionally) drop low-count IDs */
-        mergegffprot(exonerate2gffprot.out, to_remove, file("${baseDir}/modules/gff_parser.py"), 'protein')
+        /* Filter result per source: merge monoexonic genes and (optionally) drop low-count
+           IDs - each output is gene_models.<id>.gff3, tagged evidence_source=<id> internally
+           (see mergegff.nf). to_remove is a single broadcast value reused for every source. */
+        mergegffprot(exonerate2gffprot.out, to_remove, file("${baseDir}/modules/gff_parser.py"))
 
-        /* Transcript-evidence branch: same shape as the protein branch above, using
-           assembled transcripts mapped onto the genome as additional evidence for gmove. */
+        /* Combine every protein-branch source into one file for gmove/BUSCO - each feature
+           still carries its evidence_source=<id> attribute (see mergegff.nf), so origin
+           survives this merge too. */
+        mergegffprot.out
+                   .map { id, gff -> gff }
+                   .collect()
+                   .set { protein_gff_files_ch }
+        combineProteinEvidence(protein_gff_files_ch, 'protein_evidence')
+
+        /* Transcript-evidence branch: same per-source shape as the protein branch above,
+           using assembled transcripts mapped onto the genome as additional evidence for
+           gmove. params.transcriptomes can be a glob or a comma-separated list, same as
+           params.proteindatabase above - each file gets its own independent branch. */
         def transcript_gff_for_gmove
         if (params.transcriptomes) {
             Channel.fromPath(params.transcriptomes.split(',').collect { it.trim() }, checkIfExists: true)
-                   .collect()
-                   .set { transcript_files_ch }
-            mergetranscripts(transcript_files_ch)
-            cleantranscripts(mergetranscripts.out)
+                   .map { f -> tuple(sourceId(f), f) }
+                   .set { transcript_sources_ch }
+
+            cleantranscripts(transcript_sources_ch)
             clustertranscript(cleantranscripts.out, params.idtranscript)
 
             clustertranscript.out
-                   .splitFasta(by: params.chunkSize, file:true)
+                   .splitFasta(by: params.chunkSize, file: true, elem: 1)
                    .set { trans_ch }
 
             blasttranscript(params.genome_msk, trans_ch)
-            filterblasttrans(params.genome_msk, blasttranscript.out.collect(), params.idpercenttranscript, params.topHits, 'transcript')
+            blasttranscript.out
+                       .groupTuple()
+                       .set { transcript_blast_grouped_ch }
+            filterblasttrans(params.genome_msk, transcript_blast_grouped_ch, params.idpercenttranscript, params.topHits)
 
             fx2tab_transcripts(clustertranscript.out)
-            extractseqtrans(fx2tab_genome.out, fx2tab_transcripts.out, filterblasttrans.out, file("${baseDir}/modules/extractseq_v4.py"))
+            fx2tab_transcripts.out
+                       .join(filterblasttrans.out)
+                       .set { extractseqtrans_in_ch }
+            extractseqtrans(genome_tab_ch, extractseqtrans_in_ch, file("${baseDir}/modules/extractseq_v4.py"))
 
-            exoneratetrans(extractseqtrans.out.query_dir, extractseqtrans.out.genome_dir, 'est2genome', params.exoneratePercentTranscript)
+            exoneratetrans(extractseqtrans.out, 'est2genome', params.exoneratePercentTranscript)
             exonerate2gfftrans(exoneratetrans.out.exo_dir)
-            mergegfftrans(exonerate2gfftrans.out, file("${baseDir}/assets/empty_remove_list.txt"), file("${baseDir}/modules/gff_parser.py"), 'transcript')
+            mergegfftrans(exonerate2gfftrans.out, file("${baseDir}/assets/empty_remove_list.txt"), file("${baseDir}/modules/gff_parser.py"))
 
-            transcript_gff_for_gmove = mergegfftrans.out
+            mergegfftrans.out
+                       .map { id, gff -> gff }
+                       .collect()
+                       .set { transcript_gff_files_ch }
+            combineTranscriptEvidence(transcript_gff_files_ch, 'transcript_evidence')
+
+            transcript_gff_for_gmove = combineTranscriptEvidence.out
         } else {
             transcript_gff_for_gmove = file("${baseDir}/assets/NO_TRANSCRIPT_EVIDENCE")
         }
 
         /* Run gmove to get the final gene models, combining protein + transcript evidence */
-        gmove(file(params.genome), mergegffprot.out, transcript_gff_for_gmove, params.gmoveCdsMin)
+        gmove(file(params.genome), combineProteinEvidence.out, transcript_gff_for_gmove, params.gmoveCdsMin)
 
         /* Final gene models as fasta: spliced CDS (nucleotide) and translated protein.
            Always produced (not gated on run_busco) - this is the main sequence-level output
            people actually want out of the final gene set. */
         extractfasta(file(params.genome), gmove.out)
 
-        /* Optional: Busco completeness assessment at several points along the pipeline, not
-           just the final gene set - so you can see whether/where completeness improves.
-             - genome: raw assembly, mode=genome - a baseline to compare everything else to.
-             - final_gmove: gmove's final gene models, mode=proteins on the translated aa
-               fasta above - the one that actually matters for judging the annotation.
-             - protein_branch / transcript_branch: the pre-gmove exonerate-derived gene
-               models from each evidence branch, mode=transcriptome on a raw (unspliced,
-               untranslated) per-feature sequence extraction - see extractgenefasta.nf for
-               why these are only an approximate signal, not a real proteome. */
+        /* Optional: Busco completeness assessment at several points along the pipeline - not
+           just the final gene set, and not just the genome/pipeline's own output, but also
+           the raw input evidence itself, so a low score can be traced to "the input database
+           was already incomplete" vs. "the genome/pipeline lost something the input had".
+           Every step below lands in the SAME results/busco/busco_summary.tsv (one row each). */
         if (params.run_busco) {
-            // Downloaded once and reused by all four calls below (each via a local path
-            // rather than a bare lineage name) - see buscodownload.nf. Since this call's only
-            // input is a plain value (not a channel), its output is automatically a Nextflow
-            // "value channel" and safe to reference from multiple downstream processes.
+            // Downloaded once and reused by every buscoassess call below (each via a local
+            // path rather than a bare lineage name) - see buscodownload.nf. Since this call's
+            // only input is a plain value (not a channel), its output is automatically a
+            // Nextflow "value channel" and safe to reference from multiple downstream
+            // processes/parallel task instances, however many there end up being.
             buscodownload(params.busco_lineage)
 
-            buscoassessgenome(file(params.genome), 'genome', buscodownload.out, 'genome')
-            buscoassessfinal(extractfasta.out.proteins, 'proteins', buscodownload.out, 'final_gmove')
-
-            extractgenefastaprot(fx2tab_genome.out, mergegffprot.out, file("${baseDir}/modules/extractseq_genomev4.py"))
-            buscoassessprot(extractgenefastaprot.out, 'transcriptome', buscodownload.out, 'protein_branch_gene_models')
-
+            /* 1) Raw, unmasked genome assembly - a completeness baseline to compare
+               everything else to. mode=genome (busco's own internal gene prediction over the
+               whole assembly) - see buscoassess.nf for the exact command line. */
+            buscoassessgenome(tuple('genome', file(params.genome)), 'genome', buscodownload.out)
             def busco_summary_ch = buscoassessgenome.out.summary
-                    .mix(buscoassessfinal.out.summary, buscoassessprot.out.summary)
+
+            /* 2) Each protein-database file exactly as given (params.proteindatabase),
+               untouched by cleaning/clustering/blast/exonerate - does this input database
+               contain a complete BUSCO set on its own, independent of the genome or this
+               pipeline? Already real protein sequences, so mode=proteins directly - no
+               extraction or translation needed. One run per file (protein_sources_ch is the
+               same id-tagged channel the protein branch itself starts from, up at the top of
+               this workflow). */
+            protein_sources_ch
+                       .map { id, fasta -> tuple("protein_original_${id}", fasta) }
+                       .set { protein_original_busco_in_ch }
+            buscoassessprotorig(protein_original_busco_in_ch, 'proteins', buscodownload.out)
+            busco_summary_ch = busco_summary_ch.mix(buscoassessprotorig.out.summary)
+
+            /* 3) Protein-branch evidence the genome/pipeline actually recovered: per source,
+               extracted from exonerate2gffprot's raw gff (BEFORE mergegff's monoexonic merge
+               and BEFORE combineevidence's cross-source concat), then translated to protein
+               (see translateprot.nf) so this also runs mode=proteins - directly comparable to
+               (2) above. extractgenefasta.nf's own note covers why this extraction is only a
+               rough proxy (raw genomic span, "gene" and "exon" rows both extracted); on top
+               of that, translateprot.nf's note covers why the translation itself is only a
+               frame-1 guess, not a real spliced/correctly-framed CDS translation. */
+            extractgenefastaprot(genome_tab_ch, exonerate2gffprot.out, file("${baseDir}/modules/extractseq_genomev4.py"))
+            translateprot(extractgenefastaprot.out)
+            translateprot.out
+                       .map { id, fasta -> tuple("protein_branch_${id}", fasta) }
+                       .set { protein_busco_in_ch }
+            buscoassessprot(protein_busco_in_ch, 'proteins', buscodownload.out)
+            busco_summary_ch = busco_summary_ch.mix(buscoassessprot.out.summary)
 
             if (params.transcriptomes) {
-                extractgenefastatrans(fx2tab_genome.out, mergegfftrans.out, file("${baseDir}/modules/extractseq_genomev4.py"))
-                buscoassesstrans(extractgenefastatrans.out, 'transcriptome', buscodownload.out, 'transcript_branch_gene_models')
+                /* 4) Each transcriptome-assembly file exactly as given
+                   (params.transcriptomes), untouched by cleaning/clustering/blast/exonerate -
+                   same idea as (2), but these are already real assembled transcript
+                   sequences (properly spliced, unlike the raw genomic spans in (5) below), so
+                   mode=transcriptome is the textbook-correct BUSCO mode here. Re-globs the
+                   same files params.transcriptomes matches at the top of this workflow,
+                   rather than reusing that section's channel variable across the two
+                   independent `if (params.transcriptomes)` blocks. */
+                Channel.fromPath(params.transcriptomes.split(',').collect { it.trim() }, checkIfExists: true)
+                           .map { f -> tuple("transcriptome_original_${sourceId(f)}", f) }
+                           .set { transcript_original_busco_in_ch }
+                buscoassesstransorig(transcript_original_busco_in_ch, 'transcriptome', buscodownload.out)
+                busco_summary_ch = busco_summary_ch.mix(buscoassesstransorig.out.summary)
+
+                /* 5) Transcript-branch evidence the genome/pipeline actually recovered: per
+                   source, extracted from exonerate2gfftrans's raw gff (BEFORE mergegff) -
+                   same treatment as (3) but NOT translated: stays mode=transcriptome, since
+                   this extraction is still nucleotide (an unspliced genomic span, not a real
+                   transcript - see extractgenefasta.nf). */
+                extractgenefastatrans(genome_tab_ch, exonerate2gfftrans.out, file("${baseDir}/modules/extractseq_genomev4.py"))
+                extractgenefastatrans.out
+                           .map { id, fasta -> tuple("transcript_branch_${id}", fasta) }
+                           .set { transcript_busco_in_ch }
+                buscoassesstrans(transcript_busco_in_ch, 'transcriptome', buscodownload.out)
                 busco_summary_ch = busco_summary_ch.mix(buscoassesstrans.out.summary)
             }
+
+            /* 6) gmove's final gene models, mode=proteins on the translated aa fasta - the
+               one that actually matters for judging the final annotation, since only
+               gmove's own output has proper CDS/phase for a real translation. */
+            buscoassessfinal(tuple('final_gmove', extractfasta.out.proteins), 'proteins', buscodownload.out)
+            busco_summary_ch = busco_summary_ch.mix(buscoassessfinal.out.summary)
 
             buscosummary(busco_summary_ch.collect(), file("${baseDir}/modules/busco_summary.py"))
         }

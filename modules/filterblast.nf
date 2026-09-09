@@ -1,5 +1,9 @@
 #!/usr/bin/env nextflow
 
+// Runs once per source (id), on that source's blast chunks grouped back together by main.nf's
+// groupTuple() - the old `val branchLabel` ('protein'/'transcript') is gone; the output is
+// now named after the source id itself so results/candidate_regions/ gets one file per input
+// database/assembly file (e.g. candidate_regions.uniprotkb_D1.gff) instead of one per branch.
 process filterblast {
     // Closure (lazy) form: evaluated per task at run time, not once when this module is
     // parsed - see the note in nextflow.config on why that ordering matters here.
@@ -7,13 +11,12 @@ process filterblast {
 
     input:
     path genomelength
-    path blastout
+    tuple val(id), path(blastout)
     val idpercentprot
     val topHits
-    val branchLabel
 
     output:
-    path "candidate_regions.${branchLabel}.gff"
+    tuple val(id), path("candidate_regions.${id}.gff")
 
     script:
     """
@@ -34,6 +37,6 @@ process filterblast {
     #mismatch between the length table and blast's sseqid), which crashed extractseq_v4.py
     #downstream on an unparseable coordinate. This also logs a warning so a real ID mismatch
     #is still visible instead of silently working around it.
-    awk -F"\t" 'BEGIN{while(getline < "genome.lg" > 0){len[\$2]=\$1}}{OFS="\t"; chr=\$1; if((\$4-5000) < 0){newstart=1}else{newstart=\$4-5000} if(!(chr in len)){print "WARNING: no length found in genome.lg for chromosome:", chr, "- not clamping this feature end coordinate" > "/dev/stderr"; newend=\$5+5000}else if((\$5+5000)>len[chr]){newend=len[chr]}else{newend=\$5+5000} print \$1,\$2,\$3,newstart,newend,\$6,\$7,\$8,\$9}' filter3.gff > candidate_regions.${branchLabel}.gff
+    awk -F"\t" 'BEGIN{while(getline < "genome.lg" > 0){len[\$2]=\$1}}{OFS="\t"; chr=\$1; if((\$4-5000) < 0){newstart=1}else{newstart=\$4-5000} if(!(chr in len)){print "WARNING: no length found in genome.lg for chromosome:", chr, "- not clamping this feature end coordinate" > "/dev/stderr"; newend=\$5+5000}else if((\$5+5000)>len[chr]){newend=len[chr]}else{newend=\$5+5000} print \$1,\$2,\$3,newstart,newend,\$6,\$7,\$8,\$9}' filter3.gff > candidate_regions.${id}.gff
     """
 }

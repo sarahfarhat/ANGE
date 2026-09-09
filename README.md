@@ -6,45 +6,57 @@ dataset, blast it onto the genome, align matches with exonerate, merge/clean the
 resulting gene models, and run [gmove](https://github.com/institut-de-genomique/Gmove)
 to produce final gene predictions - combining protein and transcript evidence when both
 are available - with optional REPbase filtering, RNA-seq-based low-confidence gene
-removal, and Busco completeness assessment on evidences.
+removal, and Busco completeness assessment.
+
+**Every source file you point `proteindatabase`/`transcriptomes` at runs as its own
+independent branch, all the way to its own `gene_models.<source>.gff3`** - see "Evidence
+traceability by source" below.
 
 ## Pipeline steps
 
-**Protein-evidence branch** (always runs):
+**Protein-evidence branch** (always runs, once per file matched by `params.proteindatabase`):
 
 1. **cleanproteindb** - rename dataset sequences (strip characters that break downstream tools).
-2. **clusterprot** - reduce redundancy with cd-hit.
+2. **clusterprot** - reduce redundancy with cd-hit, *within* this one source file only.
 3. **repbasefilter** *(optional)* - drop sequences that blast-hit a repeat protein database.
 4. **blastprot** - `tblastn` the protein dataset against the masked genome (chunked for speed).
 5. **filterblast** - filter hits by %identity, merge nearby HSPs into candidate gene regions, keep the top N hits per protein, pad each region by 5kb.
 6. **fx2tab / extractseq** - pull out the matching genome region and query sequence for every candidate.
 7. **exonerate** (`protein2genome`) - align each query back to its genome region.
 8. **exonerate2gff** - convert exonerate's target-gff output into a proper gff3 with absolute genome coordinates.
-9. **mergegff** - merge overlapping monoexonic genes.
+9. **mergegff** - merge overlapping monoexonic genes; tags every feature `evidence_source=<source>`.
 
 **Transcript-evidence branch** *(optional - on when `params.transcriptomes` is set)*, same
-shape as above but for assembled transcripts: **mergetranscripts** (concatenate your
-per-sample fasta files) → **cleantranscripts** → **clustertranscript** (`cd-hit-est`) →
-**blasttranscript** (`blastn`) → **filterblast** → **fx2tab / extractseq** → **exonerate**
-(`est2genome`) → **exonerate2gff** → **mergegff**.
+per-source shape as above but for assembled transcripts: **cleantranscripts** →
+**clustertranscript** (`cd-hit-est`) → **blasttranscript** (`blastn`) → **filterblast** →
+**fx2tab / extractseq** → **exonerate** (`est2genome`) → **exonerate2gff** → **mergegff**,
+once per file matched by `params.transcriptomes`.
 
 **Then, regardless of the transcript branch:**
 
+- **combineevidence** - concatenates every source's `mergegff` output within a branch into
+  one `protein_evidence.gff3` / `transcript_evidence.gff3` (features keep their
+  `evidence_source` tag - see "Evidence traceability by source" below).
 - **minimap2 / samtools / gffread / featureCounts** *(optional, independent of the
   transcript-evidence branch above - see the params table)* - flag genes with weak
   RNA-seq *read* support, using raw paired-end fastq rather than assembled transcripts.
+  Computed once across all protein-branch sources combined, since read support doesn't
+  depend on which database first suggested a gene.
 - **gmove** - final gene prediction, combining `--prot` evidence (always) with `--rna`
   evidence (when the transcript branch ran).
 - **extractfasta** - pull the final gene models' CDS (nucleotide) and translated protein
   sequences out of gmove's gff3, via `gffread`.
 - **buscodownload** *(optional)* - pre-downloads the busco lineage dataset once, shared by
-  all four busco steps below via a local path rather than each downloading its own copy by
-  name (see "Known limitations" - getting this actually working end-to-end took two fixes,
-  after redundant downloads caused a real run to fail with "No space left on device").
-- **buscoassess** *(optional)* - completeness check at several points: the raw genome, each
-  branch's pre-gmove gene models, and (the one that matters most) the final gene set's
-  protein sequences - see the Output section below for what "per step" means here.
-- **buscosummary** *(optional)* - combines all of the above busco runs into one table.
+  every busco step below via a local path rather than each downloading its own copy by name
+  (see "Known limitations" - getting this actually working end-to-end took two fixes, after
+  redundant downloads caused a real run to fail with "No space left on device").
+- **buscoassess** *(optional)* - completeness check at up to six points: the raw genome;
+  each protein-database file exactly as given, and each transcriptome-assembly file exactly
+  as given (a sanity check on the *input evidence itself*, before this pipeline touches it);
+  each source's pre-gmove exonerate output, per branch (what the genome/pipeline actually
+  recovered from that input); and (the one that matters most) the final gene set's protein
+  sequences - see the Output section below for what "per step" means here.
+- **buscosummary** *(optional)* - combines every one of the above busco runs into one table.
 
 ## Requirements
 
@@ -63,7 +75,7 @@ per-sample fasta files) → **cleantranscripts** → **clustertranscript** (`cd-
 # on your HPC (see run_ANGE for the SLURM wrapper) - uses Singularity
 nextflow run main.nf -profile singularity -resume
 
-# a small local test (MacOS) run once you've added sample data under test_data/mini/ (see below) - uses Docker
+# a small local test run once you've added sample data under test_data/mini/ (see below) - uses Docker
 nextflow run main.nf -profile test -resume
 ```
 
@@ -79,30 +91,82 @@ relative to wherever you launch `nextflow run` from) as it runs:
 
 | Path | Contents |
 |---|---|
-| `results/candidate_regions/candidate_regions.protein.gff` | Blast-derived candidate regions, protein branch |
-| `results/candidate_regions/candidate_regions.transcript.gff` | Same, transcript branch (only if `transcriptomes` is set) |
-| `results/gene_models/gene_models.protein.gff3` | Exonerate-derived gene models feeding gmove's `--prot`, protein branch |
-| `results/gene_models/gene_models.transcript.gff3` | Same, transcript branch (only if `transcriptomes` is set) |
+| `results/candidate_regions/candidate_regions.<source>.gff` | Blast-derived candidate regions, one file per source file matched by `proteindatabase`/`transcriptomes` (e.g. `candidate_regions.uniprotkb_D1.gff`) |
+| `results/exonerate/exonerate.<source>.gff3` | That source's raw exonerate alignment output, in absolute genome coordinates - **before** `mergegff`'s monoexonic merge. One file per source; load these (and the ones below) as separate tracks in a genome browser (IGV, JBrowse, ...) alongside `gmove_out.gff3` to see each individual piece of evidence next to the final annotation |
+| `results/gene_models/gene_models.<source>.gff3` | Exonerate-derived gene models for that one source, **after** `mergegff`'s monoexonic merge - still per source, every feature tagged `evidence_source=<source>` |
+| `results/evidence_combined/protein_evidence.gff3` | Every protein-branch source's `gene_models.<source>.gff3` concatenated - this is what feeds gmove's `--prot` |
+| `results/evidence_combined/transcript_evidence.gff3` | Same, transcript branch (only if `transcriptomes` is set) - feeds gmove's `--rna` |
 | `results/gmove/gmove_out.gff3` | **The final gene predictions** - this is the main output |
 | `results/gmove/gmove_final.cds.fasta` | Final gene models, spliced coding (nucleotide) sequence |
 | `results/gmove/gmove_final.proteins.fasta` | Final gene models, translated protein sequence |
 | `results/busco/genome_busco/` | Busco on the raw genome assembly (`-m genome`) - a completeness baseline (only if `run_busco` is true) |
-| `results/busco/protein_branch_gene_models_busco/` | Busco on the protein branch's pre-gmove gene models (only if `run_busco` is true) |
-| `results/busco/transcript_branch_gene_models_busco/` | Same, transcript branch (only if `run_busco` and `transcriptomes` are both set) |
+| `results/busco/protein_original_<source>_busco/` | Busco on that protein-database file exactly as given (`-m proteins`, no extraction needed), one per source matched by `proteindatabase` (only if `run_busco` is true) |
+| `results/busco/protein_branch_<source>_busco/` | Busco on that source's pre-mergegff exonerate output, extracted and translated to protein (`-m proteins`), one per source (only if `run_busco` is true) |
+| `results/busco/transcriptome_original_<source>_busco/` | Busco on that transcriptome-assembly file exactly as given (`-m transcriptome`, no extraction needed), one per source matched by `transcriptomes` (only if `run_busco` and `transcriptomes` are both set) |
+| `results/busco/transcript_branch_<source>_busco/` | Busco on that source's pre-mergegff exonerate output (`-m transcriptome`, not translated), one per source (only if `run_busco` and `transcriptomes` are both set) |
 | `results/busco/final_gmove_busco/` | Busco on the **final** gene models' protein sequences (`-m proteins`) - the number that matters most (only if `run_busco` is true) |
-| `results/busco/busco_summary.tsv` | All of the above combined into one table - `step`, `lineage`, `complete_pct`, `single_copy_pct`, `duplicated_pct`, `fragmented_pct`, `missing_pct`, `n_total` (only if `run_busco` is true) |
+| `results/busco/busco_summary.tsv` | Every one of the above busco runs combined into one table - `step`, `lineage`, `complete_pct`, `single_copy_pct`, `duplicated_pct`, `fragmented_pct`, `missing_pct`, `n_total` (only if `run_busco` is true) |
 
 Set `--outdir some/other/path` to change where these land. (If you already have a stray
 `null/` directory from before this fix - `rm -rf null` to clean it up; nothing under it is
 needed, it's the exact same content that now correctly lands under `results/`.)
 
-A note on what "per step" busco means here: only gmove's own gff3 output carries proper
-`CDS`/phase annotations, so only `final_gmove` is scored on a real, correctly-translated
-protein set (`-m proteins`) - which is also why that's the number to trust most. The
-`genome`, `protein_branch_gene_models` and `transcript_branch_gene_models` runs use
-`-m genome` / `-m transcriptome` on raw, unspliced sequence extractions instead (see
-extractgenefasta.nf) - useful as a rough trend across the pipeline, but not directly
-comparable to a "real" transcriptome/proteome BUSCO score.
+### Evidence traceability by source
+
+`proteindatabase` and `transcriptomes` each accept a glob or comma-separated list of files
+(e.g. three `uniprotkb_D*.fasta` slices, or 13 `spades_mimit*` assemblies). Rather than
+concatenating them into one dataset before processing, **every matched file runs through
+its own independent branch** - clean → cluster → [repbase] → blast → extract → exonerate →
+mergegff - each tagged with a "source id" derived from that file's name (e.g.
+`uniprotkb_D1`, `spades_mimit05_transcripts_renamed`). This is a deliberate trade-off:
+
+- **What you get**: a gff for every single input file at three stages -
+  `results/candidate_regions/candidate_regions.<source>.gff` (blast hits),
+  `results/exonerate/exonerate.<source>.gff3` (raw exonerate alignment, before mergegff), and
+  `results/gene_models/gene_models.<source>.gff3` (after mergegff) - so you can always tell
+  which database or assembly contributed a given gene model, and load any of them as their
+  own track in a genome browser next to `results/gmove/gmove_out.gff3`. Even after all
+  sources are concatenated into `protein_evidence.gff3` / `transcript_evidence.gff3` for
+  gmove, every feature still carries an `evidence_source=<source>` GFF3 attribute, so origin
+  is recoverable from the final merged evidence file too - not just the per-source ones.
+- **What it costs**: `cd-hit`/`cd-hit-est` only removes redundancy *within* one source file,
+  never *across* sources. If your input files overlap a lot (e.g. near-identical protein
+  entries duplicated across `uniprotkb_D1/D2/D3`, or largely-redundant assemblies), the same
+  near-duplicate sequences get blasted and exonerate-aligned separately in each source's
+  branch instead of once - meaningfully more compute/runtime than merging everything first.
+
+If you'd rather have the old merge-everything-first behavior for speed (at the cost of this
+per-file traceability), say so and it can be swapped back.
+
+A note on what "per step" busco means here - six kinds of step, all landing together in one
+`busco_summary.tsv`:
+
+- **`genome`** - the raw, unmasked assembly, `-m genome`. A baseline.
+- **`protein_original_<source>`** / **`transcriptome_original_<source>`** - each input file
+  matched by `proteindatabase` / `transcriptomes`, completely untouched by this pipeline (no
+  cleaning, clustering, blasting, or extraction) - one BUSCO run per file, straight on what
+  you gave it. Protein files are already protein sequences (`-m proteins`); transcriptome
+  files are already properly spliced assembled transcripts (`-m transcriptome`, the
+  textbook-correct mode for that kind of sequence). This is a check on the *input evidence's
+  own* completeness, independent of the genome or anything this pipeline does.
+- **`protein_branch_<source>`** / **`transcript_branch_<source>`** - per source again, but
+  now the evidence the genome/pipeline actually *recovered*: extracted straight from that
+  source's raw `exonerate2gff` output - **before** `mergegff`'s monoexonic merge and
+  **before** `combineevidence`'s cross-source concat (see extractgenefasta.nf) - so an
+  `_original_` and a `_branch_` score for the same source id are directly comparable, and a
+  gap between them tells you whether the shortfall is in the input database/assembly itself
+  or in what the genome + blast/exonerate pipeline managed to find. The protein branch's
+  extraction is additionally translated to protein (see translateprot.nf) so it runs
+  `-m proteins` like its `_original_` counterpart; the transcript branch's stays nucleotide
+  (`-m transcriptome`), since it's still an unspliced genomic span, not a real transcript.
+  Two caveats specific to these two: (1) the raw `exonerate2gff` output has both `gene` and
+  `exon` rows for every feature and both get extracted, so a feature contributes two
+  sequences (full span + exon span) to `n_total`, not one; (2) `translateprot`'s frame-1
+  translation is a guess (the real reading frame isn't known at this point in the pipeline),
+  so expect more frameshifts/premature stops here than in a properly framed CDS translation.
+- **`final_gmove`** - gmove's own gff3 output, the only one with proper `CDS`/phase
+  annotations, so the only step scored on a real, correctly-translated protein set
+  (`-m proteins`) - this is the number to trust most for judging the final annotation.
 
 Core parameters (set in `nextflow.config` or with `--paramName value`):
 
@@ -111,7 +175,7 @@ Core parameters (set in `nextflow.config` or with `--paramName value`):
 | `outdir` | `results` | Where published output files are copied to |
 | `genome` | - | Unmasked genome fasta (used for sequence extraction, gmove, Busco) |
 | `genome_msk` | - | Masked genome fasta (used for the blast database) |
-| `proteindatabase` | - | Protein (or transcript) dataset fasta, optionally gzipped |
+| `proteindatabase` | - | Protein dataset fasta(s), optionally gzipped - a glob (e.g. `"db/*.fasta"`) or comma-separated list; each file gets its own independent branch (see "Evidence traceability by source") |
 | `species` | - | Label used in log output |
 | `nb_cpus` | 28 | CPUs given to every process |
 | `idprot` | 0.95 | cd-hit clustering identity |
@@ -125,7 +189,7 @@ Transcript-evidence branch (off unless `transcriptomes` is set):
 
 | Param | Default | Meaning |
 |---|---|---|
-| `transcriptomes` | `""` | Glob (e.g. `"test_data/*.fasta"`) or comma-separated list of assembled-transcript fasta files. Setting this turns the whole branch on. |
+| `transcriptomes` | `""` | Glob (e.g. `"test_data/*.fasta"`) or comma-separated list of assembled-transcript fasta files. Setting this turns the whole branch on; each file gets its own independent branch, same as `proteindatabase` (see "Evidence traceability by source"). |
 | `idtranscript` | 0.99 | cd-hit-est clustering identity |
 | `idpercenttranscript` | 90 | Minimum %identity kept from the transcript blast |
 | `exoneratePercentTranscript` | 80 | exonerate `--percent` threshold, transcript branch |
@@ -149,7 +213,7 @@ GitHub's 100MB file size limit so `-profile test` works out of the box on a fres
 
 ## Fixes and design calls made while wiring this up
 
-The original design doc (made by Giacomo Chiappa) had draft awk/shell snippets with a handful of small bugs. All
+The original design doc had draft awk/shell snippets with a handful of small bugs. All
 noted inline in the relevant module, summarized here:
 
 - **filterblast**: the genome chromosome-length calculation was missing its `END` block,
@@ -237,3 +301,12 @@ noted inline in the relevant module, summarized here:
 - This pipeline was built and reviewed without being able to actually execute Nextflow in
   this environment (network restrictions), so please run it and send me any errors -
   they're usually quick fixes.
+- **Per-source branching (the `evidence_source`-tagged design above)** is the part of this
+  pipeline I'm least able to verify without running it: it relies on Nextflow's
+  `splitFasta(..., elem: 1)`, `groupTuple()` and `.join()` operators threading a source id
+  through every module correctly, which I've checked carefully against Nextflow's
+  documented behavior but couldn't confirm end-to-end. After your first real run, check
+  that `results/gene_models/` has one `gene_models.<source>.gff3` per input file (not fewer,
+  and not empty), and that `results/evidence_combined/protein_evidence.gff3` (and
+  `transcript_evidence.gff3`, if set) has an `evidence_source=` tag on every feature line
+  matching one of your source filenames.

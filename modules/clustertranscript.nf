@@ -1,13 +1,15 @@
 #!/usr/bin/env nextflow
 
+// id carried through untouched (see cleanproteindb.nf) - runs once per source file, so
+// redundancy is only removed *within* one source, never across sources.
 process clustertranscript {
     container 'community.wave.seqera.io/library/cd-hit:4.8.1--8078bb96af799bf2'
     input:
-    path transcripts_file
+    tuple val(id), path(transcripts_file)
     val idper
 
     output:
-    path "cleaned_transcripts.fasta"
+    tuple val(id), path("cleaned_transcripts.fasta")
 
     script:
     """

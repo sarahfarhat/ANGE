@@ -1,11 +1,19 @@
 #!/usr/bin/env nextflow
 
+// id carried through untouched. Published (unlike before) so every source's raw, per-feature
+// alignment evidence - BEFORE mergegff's monoexonic merge, and well before combineevidence's
+// cross-source concat - is available as its own file: one gff3 per protein-database and
+// transcriptome-assembly file, in absolute genome coordinates, ready to load as a track in a
+// genome browser (IGV, JBrowse, ...) alongside results/gmove/gmove_out.gff3 to see exactly
+// what each individual source of evidence looked like before any merging happened.
 process exonerate2gff {
+    publishDir { "${params.outdir}/exonerate" }, mode: 'copy'
+
     input:
-    path exo_dir
+    tuple val(id), path(exo_dir)
 
     output:
-    path "exonerate_out.gff3"
+    tuple val(id), path("exonerate.${id}.gff3")
 
     script:
     """
@@ -31,6 +39,6 @@ process exonerate2gff {
             \$9="Parent=EXOTRANS1_"sprintf("%08d",cpt)";"t[7]"="t[8]";"t[10]"="t[11];
         }
         print i[1],\$2,\$3,i[2]+\$4-1,i[2]+\$5-1,\$6,\$7,\$8,\$9
-    }' exonerate_out.gff2 > exonerate_out.gff3
+    }' exonerate_out.gff2 > exonerate.${id}.gff3
     """
 }

@@ -1,27 +1,27 @@
 #!/usr/bin/env nextflow
 
+// The `val branchLabel` ('protein'/'transcript') is gone - output is now named after the
+// source id itself, so results/gene_models/ gets one file per input database/assembly file
+// (e.g. gene_models.uniprotkb_D1.gff3, gene_models.spades_mimit05_transcripts_renamed.gff3)
+// instead of one per branch. On top of that, every feature gets an evidence_source=<id>
+// GFF3 attribute appended, so origin stays recoverable even after main.nf's combineevidence
+// step concatenates every source's file into the single --prot / --rna evidence gmove needs.
 process mergegff {
     // Closure (lazy) form: evaluated per task at run time, not once when this module is
     // parsed - see the note in nextflow.config on why that ordering matters here.
     publishDir { "${params.outdir}/gene_models" }, mode: 'copy'
 
     input:
-    path exonerate_gff3
+    tuple val(id), path(exonerate_gff3)
     path to_remove_list
     path 'gff_parser.py'
-    val branchLabel
 
     output:
-    path "gene_models.${branchLabel}.gff3"
+    tuple val(id), path("gene_models.${id}.gff3")
 
     script:
-    // gff_parser.py names its own output after its input file's basename (e.g.
-    // "<input>_NR.gff3"), which is identical for both branches upstream (both exonerate2gff
-    // calls write "exonerate_out.gff3") - so it's copied here to a branch-labeled name
-    // rather than relying on that derived name, which would collide once both branches'
-    // outputs meet downstream (e.g. at gmove, or here in the shared publishDir).
     """
     python3 gff_parser.py ${exonerate_gff3} ${to_remove_list}
-    cp \$(ls *_NR.gff3 | head -1) gene_models.${branchLabel}.gff3
+    awk 'BEGIN{OFS="\t"}{\$9=\$9";evidence_source=${id}"; print}' \$(ls *_NR.gff3 | head -1) > gene_models.${id}.gff3
     """
 }
