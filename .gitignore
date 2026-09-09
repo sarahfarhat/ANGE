@@ -1,0 +1,29 @@
+# Nextflow run artifacts and execution traces - regenerated on every run, shouldn't be versioned
+work/
+.nextflow/
+.nextflow.log*
+.nextflow.pid
+trace*.txt
+report*.html
+timeline*.html
+dag*.html
+
+# Pipeline outputs - regenerated, can be large/binary
+results/
+results.1chrom/
+
+# macOS Finder clutter
+.DS_Store
+
+# Original design doc - not part of the pipeline itself, kept locally rather than in the repo
+Mitra_mitra_analysis_pipeline_250925_nextflow.docx
+
+# Test data: keep the small, checked-in mini/ subset (needed for `-profile test`), but not
+# the full-size genome/protein/transcript files alongside it.
+test_data/*
+!test_data/mini/
+test_data/mini/*.bak
+
+# Any large data file accidentally dropped at the repo root (e.g. a protein database fasta)
+/*.fasta
+/*.fasta.gz
