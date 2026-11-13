@@ -1,7 +1,9 @@
 #!/usr/bin/env nextflow
 
 process buscoassess {
-    container 'community.wave.seqera.io/library/busco:6.1.0--6d1f7006d91892b3'
+    // Same official ezlabgva image as buscodownload.nf - see the note there for why the
+    // Seqera Community Container build failed with "busco: command not found".
+    container 'ezlabgva/busco:v6.1.0_cv2'
     // Closure (lazy) form: evaluated per task at run time, not once when this module is
     // parsed - see the note in nextflow.config on why that ordering matters here.
     publishDir { "${params.outdir}/busco" }, mode: 'copy'
